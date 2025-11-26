@@ -1,1 +1,255 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <ESP32Servo.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include "DHT.h"
 
+// ---------------------- Pin Configuration ----------------------
+#define DHTPIN 4
+#define DHTTYPE DHT11
+#define RAIN_DIGITAL 27
+#define LDR_RIGHT 32
+#define LDR_LEFT 33
+#define SERVO_PIN 13
+#define VOLTAGE_PIN 34
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+// ---------------------- WiFi & MQTT ----------------------
+// const char* ssid = "patonggoo";
+// const char* password = "al0909131255";
+// const char* mqtt_server = "172.20.10.6";
+// const int mqtt_port = 1883;
+// const char* esp_client_id = "SolarTracker_001";
+// const char* mqtt_username = "panchanit";
+// const char* mqtt_password = "al0909131255";
+// const char* mqtt_topic = "solar/tracker001/data";
+const char* ssid = "tym";
+const char* password = "lmaolmao";
+const char* mqtt_server = "0e4358d2630e49328a93a933234111be.s1.eu.hivemq.cloud";
+const int mqtt_port = 8883;
+const char* esp_client_id = "SolarTracker_001";
+const char* mqtt_username = "SolarCellTracker";
+const char* mqtt_password = "Sct123456";
+const char* mqtt_topic = "solar/tracker001/data";
+
+// ---------------------- Objects ----------------------
+DHT dht(DHTPIN, DHTTYPE);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+WiFiClientSecure espClient;
+PubSubClient client(espClient);
+Servo myservo;
+
+// ---------------------- Global Variables ----------------------
+int servoAngle = 90;
+float voltage_sum = 0.0;
+int sample_count = 0;
+bool isMoving = true;
+int rainValue = 0;
+
+// ---------------------- Timers ----------------------
+unsigned long currentMillis = 0;
+unsigned long lastServoMillis = 0;
+unsigned long lastDisplayMillis = 0;
+const unsigned long servoInterval = 300;      // 0.3 วินาที
+const unsigned long displayInterval = 5000;  // 1 นาที
+
+// ==========================================================
+// 📘 ฟังก์ชันอ่านแรงดัน พร้อมคาลิเบรต Polynomial
+// ==========================================================
+float readVoltage() {
+  const int adcBits = 12;    // ADC ความละเอียด 12 บิต (0–4095)
+  const float Vref = 3.3;    // แรงดันอ้างอิง 3.3 V
+  const float R1 = 30000.0;  // 30k ohm
+  const float R2 = 7500.0;   // 7.5k ohm
+
+  // ค่าคาลิเบรต Polynomial
+  const float calib_a = 0.0481;
+  const float calib_b = -0.3331;
+  const float calib_c = 1.6227;
+  const float calib_d = 0.5168;
+
+  const int numSamples = 100;
+  float sumVin = 0.0;
+  int rawV;
+
+  // อ่านค่า Vin หลายครั้งเพื่อหาค่าเฉลี่ย
+  for (int i = 0; i < numSamples; i++) {
+    rawV = analogRead(VOLTAGE_PIN);
+    float vout = rawV * Vref / (float)(1 << adcBits);
+    float vin = vout * (R1 + R2) / R2;
+    sumVin += vin;
+    delay(2);  // สั้นลงเพื่อไม่ให้ block loop
+  }
+
+  float avgVin = sumVin / numSamples;
+
+  // Apply polynomial calibration
+  float vin_cal = (calib_a * pow(avgVin, 3)) + (calib_b * pow(avgVin, 2)) + (calib_c * avgVin) + calib_d;
+
+  return vin_cal;
+}
+
+// ==========================================================
+// 📘 ฟังก์ชันเชื่อมต่อ MQTT
+// ==========================================================
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    if (client.connect(esp_client_id, mqtt_username, mqtt_password)) {
+      Serial.println("connected");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.println(client.state());
+      delay(5000);
+    }
+  }
+}
+
+// ==========================================================
+// 📘 ฟังก์ชันควบคุมเซอร์โว
+// ==========================================================
+void updateServo() {
+  int rightValue = analogRead(LDR_RIGHT);
+  int leftValue = analogRead(LDR_LEFT);
+  rainValue = digitalRead(RAIN_DIGITAL);
+  int diff = leftValue - rightValue;
+  int sensitivity = 2;
+
+  if (rainValue == 1) {
+    if (abs(diff) > 200) {
+      isMoving = true;
+      if (leftValue > rightValue) {
+        servoAngle = constrain(servoAngle + sensitivity, 0, 180);
+        myservo.write(servoAngle);
+      } else {
+        servoAngle = constrain(servoAngle - sensitivity, 0, 180);
+        myservo.write(servoAngle);
+      }
+    }
+
+    if (abs(diff) <= 200) {
+      isMoving = false;
+    }
+  } else {
+    if (servoAngle != 90) {
+      if (servoAngle > 90) {
+        servoAngle = constrain(servoAngle - sensitivity, 90, 180);
+      } else {
+        servoAngle = constrain(servoAngle + sensitivity, 0, 90);
+      }
+      myservo.write(servoAngle);
+    }
+    // if (isMoving) {
+    //   myservo.write(servoAngle);
+    // }
+  }
+
+  Serial.printf("Left:%d | Right:%d | Rain:%d | Servo:%d\n",
+                leftValue, rightValue, rainValue, servoAngle);
+}
+
+// ==========================================================
+// 📘 ฟังก์ชันแสดงผลบนจอ LCD
+// ==========================================================
+void updateDisplay(float avgV, float h, float t) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Volt:");
+  lcd.print(avgV, 2);
+  lcd.print("V");
+
+  lcd.setCursor(0, 1);
+  lcd.print("H:");
+  lcd.print(h, 1);
+  lcd.print("% T:");
+  lcd.print(t, 1);
+  lcd.print("C");
+}
+
+// ==========================================================
+// 📘 ฟังก์ชันส่งข้อมูลไป MQTT
+// ==========================================================
+void publishMQTT(float percentage, float h, float t) {
+  if (!client.connected()) reconnect();
+  client.loop();
+
+  String payload = "{\"device_id001\":{\"battery_percent\":" + String(percentage, 0) + ",\"humidity\":" + String(h, 1) + ",\"temperature\":" + String(t, 1) + ",\"rain\":" + String(rainValue) + "}}";
+
+  if (client.publish(mqtt_topic, payload.c_str()))
+    Serial.println("MQTT Published!");
+  else
+    Serial.println("MQTT Publish failed.");
+}
+
+// ==========================================================
+// 📘 Setup
+// ==========================================================
+void setup() {
+  Serial.begin(115200);
+  myservo.attach(SERVO_PIN);
+  myservo.write(servoAngle);
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("WiFi Connected!");
+
+  espClient.setInsecure();
+  client.setServer(mqtt_server, mqtt_port);
+  Wire.begin(SDA_PIN, SCL_PIN);
+  dht.begin();
+  pinMode(RAIN_DIGITAL, INPUT);
+
+  lcd.init();
+  lcd.backlight();
+  Serial.println("System Initialized");
+}
+
+// ==========================================================
+// 📘 Loop
+// ==========================================================
+void loop() {
+  currentMillis = millis();
+
+  // --- อ่านแรงดันและสะสมค่า ---
+  float voltage = readVoltage();
+  voltage_sum += voltage;
+  sample_count++;
+
+  // --- ควบคุม Servo ทุก 0.5 วินาที ---
+  if (currentMillis - lastServoMillis >= servoInterval) {
+    lastServoMillis = currentMillis;
+    updateServo();
+  }
+
+  // --- แสดงผลและส่งข้อมูลทุก 1 นาที ---
+  if (currentMillis - lastDisplayMillis >= displayInterval) {
+    lastDisplayMillis = currentMillis;
+
+    float avgV = voltage_sum / sample_count;
+    voltage_sum = 0;
+    sample_count = 0;
+
+    float percent = ((avgV - 3.0) / (4.2 - 3.0)) * 100.0;
+    percent = constrain(percent, 0, 100);
+
+    float h = dht.readHumidity();
+    float t = dht.readTemperature();
+
+  Serial.printf("Vcal:%.3f | percentage:%.0f | H:%.1f | T:%.1f\n",
+                avgV, percent, h, t);
+
+    if (!isnan(h) && !isnan(t)) {
+      //updateDisplay(avgV, h, t);
+      publishMQTT(percent, h, t);
+    } else {
+      Serial.println("Failed to read DHT!");
+    }
+  }
+}
